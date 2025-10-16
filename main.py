@@ -1,5 +1,11 @@
 # main.py — Telegram group anti-spam bot (keywords version) for Render Web Service
-import os, re, time, threading
+import atexit
+import json
+import os
+import re
+import threading
+import time
+from pathlib import Path
 from collections import defaultdict
 from flask import Flask
 from telebot import TeleBot
@@ -16,11 +22,13 @@ app = Flask(__name__)
 WARN_THRESHOLD = int(os.environ.get("WARN_THRESHOLD", "2"))     # warnings before punishment
 MUTE_SECONDS   = int(os.environ.get("MUTE_SECONDS", "3600"))    # mute seconds (0 => kick)
 DELETE_NOTICE  = os.environ.get("DELETE_NOTICE", "true").lower() == "true"
+STATE_FILE     = os.environ.get("STATE_FILE", "data/state.json")
 
 # per-chat keyword set + compiled regex cache + warnings
 chat_keywords   = defaultdict(set)       # chat_id -> {kw,...}; kw string or /regex/
 chat_regex_cache= {}                     # chat_id -> compiled regex
 user_warnings   = defaultdict(int)       # f"{chat_id}:{user_id}" -> count
+state_lock      = threading.RLock()
 
 def is_admin(chat_id, user_id):
     try:
@@ -30,31 +38,82 @@ def is_admin(chat_id, user_id):
         return False
 
 def build_regex(chat_id):
-    kws = chat_keywords.get(chat_id, set())
-    if not kws:
-        chat_regex_cache.pop(chat_id, None)
-        return None
-    parts = []
-    for kw in kws:
-        kw = kw.strip()
-        if not kw:
-            continue
-        if kw.startswith("/") and kw.endswith("/"):
-            parts.append(f"(?:{kw[1:-1]})")
-        else:
-            parts.append(re.escape(kw))
-    try:
-        rx = re.compile("|".join(parts), re.I | re.DOTALL)
-    except re.error:
-        rx = re.compile("|".join(re.escape(k) for k in kws), re.I | re.DOTALL)
-    chat_regex_cache[chat_id] = rx
-    return rx
+    with state_lock:
+        kws = chat_keywords.get(chat_id, set())
+        if not kws:
+            chat_regex_cache.pop(chat_id, None)
+            return None
+        parts = []
+        for kw in kws:
+            kw = kw.strip()
+            if not kw:
+                continue
+            if kw.startswith("/") and kw.endswith("/"):
+                parts.append(f"(?:{kw[1:-1]})")
+            else:
+                parts.append(re.escape(kw))
+        try:
+            rx = re.compile("|".join(parts), re.I | re.DOTALL)
+        except re.error:
+            rx = re.compile("|".join(re.escape(k) for k in kws), re.I | re.DOTALL)
+        chat_regex_cache[chat_id] = rx
+        return rx
 
 def ensure_regex(chat_id):
-    rx = chat_regex_cache.get(chat_id)
-    if rx is None:
-        rx = build_regex(chat_id)
-    return rx
+    with state_lock:
+        rx = chat_regex_cache.get(chat_id)
+        if rx is None:
+            rx = build_regex(chat_id)
+        return rx
+
+
+def save_state():
+    with state_lock:
+        payload = {
+            "chat_keywords": {str(cid): sorted(kws) for cid, kws in chat_keywords.items() if kws},
+            "user_warnings": dict(user_warnings),
+        }
+        path = Path(STATE_FILE)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            with tmp_path.open("w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+            tmp_path.replace(path)
+        except Exception as exc:
+            print("Failed to save state:", exc, flush=True)
+
+
+def load_state():
+    path = Path(STATE_FILE)
+    if not path.exists():
+        return
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except Exception as exc:
+        print("Failed to load state:", exc, flush=True)
+        return
+    with state_lock:
+        chat_keywords.clear()
+        chat_regex_cache.clear()
+        user_warnings.clear()
+        for cid, kws in payload.get("chat_keywords", {}).items():
+            try:
+                cid_int = int(cid)
+            except (TypeError, ValueError):
+                continue
+            chat_keywords[cid_int] = set(kws or [])
+            build_regex(cid_int)
+        for key, value in payload.get("user_warnings", {}).items():
+            try:
+                user_warnings[key] = int(value)
+            except (TypeError, ValueError):
+                continue
+
+
+load_state()
+atexit.register(save_state)
 
 def punish(chat_id, user_id, name, warns):
     try:
@@ -75,8 +134,10 @@ def punish(chat_id, user_id, name, warns):
 def handle_violation(message):
     cid, uid = message.chat.id, message.from_user.id
     key = f"{cid}:{uid}"
-    user_warnings[key] += 1
-    warns = user_warnings[key]
+    with state_lock:
+        user_warnings[key] += 1
+        warns = user_warnings[key]
+    save_state()
     try:
         bot.delete_message(cid, message.message_id)
     except Exception:
@@ -102,9 +163,11 @@ def addkw(msg):
         bot.reply_to(msg, "用法：/addkw 关键词1 关键词2 ...\n正则：/addkw /\\b免费(领取|送)/ /https?:\\/\\/t\\.cn/")
         return
     items = [s for s in parts[1].split() if s]
-    for k in items:
-        chat_keywords[msg.chat.id].add(k)
-    build_regex(msg.chat.id)
+    with state_lock:
+        for k in items:
+            chat_keywords[msg.chat.id].add(k)
+        build_regex(msg.chat.id)
+    save_state()
     bot.reply_to(msg, f"✅ 已添加 {len(items)} 个关键词。")
 
 @bot.message_handler(commands=["rmkw"])
@@ -116,17 +179,20 @@ def rmkw(msg):
         return
     items = [s for s in parts[1].split() if s]
     removed = 0
-    for k in items:
-        if k in chat_keywords[msg.chat.id]:
-            chat_keywords[msg.chat.id].remove(k)
-            removed += 1
-    build_regex(msg.chat.id)
+    with state_lock:
+        for k in items:
+            if k in chat_keywords[msg.chat.id]:
+                chat_keywords[msg.chat.id].remove(k)
+                removed += 1
+        build_regex(msg.chat.id)
+    save_state()
     bot.reply_to(msg, f"🧹 已移除 {removed} 个关键词。")
 
 @bot.message_handler(commands=["listkw"])
 @admin_only
 def listkw(msg):
-    kws = sorted(chat_keywords.get(msg.chat.id, set()))
+    with state_lock:
+        kws = sorted(chat_keywords.get(msg.chat.id, set()))
     if not kws:
         bot.reply_to(msg, "当前无关键词。用 /addkw 添加。")
     else:
@@ -137,8 +203,10 @@ def listkw(msg):
 @bot.message_handler(commands=["clearkw"])
 @admin_only
 def clearkw(msg):
-    chat_keywords[msg.chat.id].clear()
-    build_regex(msg.chat.id)
+    with state_lock:
+        chat_keywords[msg.chat.id].clear()
+        build_regex(msg.chat.id)
+    save_state()
     bot.reply_to(msg, "🧽 已清空关键词。")
 
 @bot.message_handler(commands=["warns", "resetwarns"])
@@ -146,12 +214,17 @@ def clearkw(msg):
 def warns_cmd(msg):
     cid = msg.chat.id
     if msg.text.startswith("/resetwarns"):
-        keys = [k for k in list(user_warnings.keys()) if k.startswith(f"{cid}:")]
-        for k in keys: user_warnings.pop(k, None)
+        with state_lock:
+            keys = [k for k in list(user_warnings.keys()) if k.startswith(f"{cid}:")]
+            for k in keys:
+                user_warnings.pop(k, None)
+        save_state()
         bot.reply_to(msg, "已清空本群警告计数。")
     else:
         lines = []
-        for k,v in user_warnings.items():
+        with state_lock:
+            items = list(user_warnings.items())
+        for k, v in items:
             scid, uid = k.split(":")
             if int(scid) == cid:
                 lines.append(f"user_id {uid} -> warns {v}")

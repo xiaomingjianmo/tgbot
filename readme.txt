@@ -17,6 +17,7 @@ Render 部署说明（Telegram 群关键词杀广机器人）
 - WARN_THRESHOLD = 2
 - MUTE_SECONDS = 3600
 - DELETE_NOTICE = true
+- STATE_FILE = data/state.json （可选，修改持久化文件路径）
 
 三、启动命令
 ------------
@@ -44,4 +45,4 @@ web: python main.py
 ------------
 - 没删消息：检查是否管理员、隐私模式是否关闭、关键词是否命中。
 - 不禁言：达到 WARN_THRESHOLD+1 次才处罚；并需“限制成员”权限。
-- 需要持久化关键词：可改为 SQLite（如需我可以提供持久化版本）。
+- 关键词／警告持久化：已内置文件持久化，默认保存到 `data/state.json`，也可通过 `STATE_FILE` 环境变量自定义。
