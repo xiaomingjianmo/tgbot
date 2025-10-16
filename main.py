@@ -179,8 +179,14 @@ def ping():
     return "pong", 200
 
 def start_polling():
-    # Start TeleBot long polling in a background thread
-    bot.infinity_polling(timeout=60, long_polling_timeout=60)
+    # Start TeleBot long polling in a resilient background thread
+    bot.remove_webhook()
+    while True:
+        try:
+            bot.infinity_polling(timeout=60, long_polling_timeout=60, skip_pending=True)
+        except Exception as exc:
+            print("Polling error, retrying in 5s:", exc, flush=True)
+            time.sleep(5)
 
 if __name__ == "__main__":
     # Start bot in background thread
